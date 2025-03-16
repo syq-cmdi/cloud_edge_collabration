@@ -1,0 +1,519 @@
+import numpy as np
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from collections import deque, namedtuple
+import networkx as nx
+import math
+import time
+import pandas as pd
+import os
+import glob
+from datetime import datetime
+from scipy.spatial.distance import pdist, squareform
+
+# 设置随机种子以保证可重现性
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 超参数
+BATCH_SIZE = 32
+GAMMA = 0.95  # 折扣因子
+EPS_START = 0.1  # 起始探索率
+EPS_END = 0.01  # 最终探索率
+EPS_DECAY = 200  # 探索率衰减速度
+TARGET_UPDATE = 10  # 目标网络更新频率
+LEARNING_RATE = 0.01  # 神经网络学习率
+MEMORY_SIZE = 500  # 回放记忆容量
+NUM_EPISODES = 400  # 训练轮数
+MAX_STEPS = 100  # 每轮最大步数
+
+# 定义Experience数据类型
+Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
+
+# 数据加载和预处理函数
+class AlibabaDataLoader:
+    def __init__(self, data_path):
+        """初始化数据加载器
+        
+        Args:
+            data_path: 阿里巴巴集群数据CSV文件所在路径
+        """
+        self.data_path = data_path
+        self.instance_info = None
+        self.machine_info = None
+        self.resource_usage = None
+        self.instance_placement = None
+        self.topology = None
+        
+    def load_data(self):
+        """加载所有CSV数据文件"""
+        print("加载阿里巴巴GPU集群数据...")
+        
+        # 加载实例信息
+        instance_path = os.path.join(self.data_path, "instance_info.csv")
+        if os.path.exists(instance_path):
+            self.instance_info = pd.read_csv(instance_path)
+            print(f"实例信息加载完成，共 {len(self.instance_info)} 条记录")
+        else:
+            print(f"警告: 未找到文件 {instance_path}")
+            
+        # 加载机器信息
+        machine_path = os.path.join(self.data_path, "machine_info.csv")
+        if os.path.exists(machine_path):
+            self.machine_info = pd.read_csv(machine_path)
+            print(f"机器信息加载完成，共 {len(self.machine_info)} 台机器")
+        else:
+            print(f"警告: 未找到文件 {machine_path}")
+            
+        # 加载资源使用情况
+        resource_path = os.path.join(self.data_path, "instance_avg_resource_usage.csv")
+        if os.path.exists(resource_path):
+            # 由于此文件可能很大，我们可以只加载部分数据进行测试
+            self.resource_usage = pd.read_csv(resource_path, nrows=100000)
+            print(f"资源使用信息加载完成，加载了 {len(self.resource_usage)} 条记录")
+        else:
+            print(f"警告: 未找到文件 {resource_path}")
+            
+        # 加载实例放置信息
+        placement_path = os.path.join(self.data_path, "instance_placement.csv")
+        if os.path.exists(placement_path):
+            self.instance_placement = pd.read_csv(placement_path)
+            print(f"实例放置信息加载完成，共 {len(self.instance_placement)} 条记录")
+        else:
+            print(f"警告: 未找到文件 {placement_path}")
+            
+        # 加载拓扑信息
+        topology_path = os.path.join(self.data_path, "topology.csv")
+        if os.path.exists(topology_path):
+            self.topology = pd.read_csv(topology_path)
+            print(f"拓扑信息加载完成，共 {len(self.topology)} 条连接记录")
+        else:
+            print(f"警告: 未找到文件 {topology_path}")
+    
+    def preprocess_data(self):
+        """预处理数据，为模拟做准备"""
+        print("预处理数据...")
+        
+        # 预处理实例信息
+        if self.instance_info is not None:
+            # 将时间字符串转换为datetime对象
+            self.instance_info['create_time'] = pd.to_datetime(self.instance_info['create_time'])
+            self.instance_info['end_time'] = pd.to_datetime(self.instance_info['end_time'])
+            
+            # 计算任务持续时间（分钟）
+            self.instance_info['duration'] = (self.instance_info['end_time'] - 
+                                             self.instance_info['create_time']).dt.total_seconds() / 60
+            
+            # 移除持续时间为0或负值的实例
+            self.instance_info = self.instance_info[self.instance_info['duration'] > 0]
+            
+            print("实例信息预处理完成")
+        
+        # 预处理资源使用信息
+        if self.resource_usage is not None:
+            # 转换时间戳
+            if 'timestamp' in self.resource_usage.columns:
+                self.resource_usage['timestamp'] = pd.to_datetime(self.resource_usage['timestamp'])
+            
+            # 填充缺失值
+            numeric_cols = self.resource_usage.select_dtypes(include=[np.number]).columns
+            self.resource_usage[numeric_cols] = self.resource_usage[numeric_cols].fillna(0)
+            
+            print("资源使用信息预处理完成")
+        
+        # 预处理拓扑信息
+        if self.topology is not None:
+            # 确保拓扑数据中的节点ID是整数
+            if 'source_id' in self.topology.columns and 'target_id' in self.topology.columns:
+                self.topology['source_id'] = self.topology['source_id'].astype(int)
+                self.topology['target_id'] = self.topology['target_id'].astype(int)
+            
+            print("拓扑信息预处理完成")
+    
+    def create_network_topology(self):
+        """基于拓扑数据创建网络拓扑图"""
+        G = nx.Graph()
+        
+        if self.topology is not None and 'source_id' in self.topology.columns:
+            # 添加节点
+            if self.machine_info is not None:
+                for _, machine in self.machine_info.iterrows():
+                    machine_id = machine['machine_id']
+                    # 根据机器的GPU数量决定是否为边缘节点或云节点
+                    # 假设GPU数量高的是云节点，低的是边缘节点
+                    is_cloud = machine['gpu_num'] >= self.machine_info['gpu_num'].median()
+                    G.add_node(machine_id, is_cloud=is_cloud, gpu_num=machine['gpu_num'],
+                              cpu_num=machine['cpu_num'], mem_size=machine['mem_size'])
+            
+            # 添加边（连接）
+            for _, link in self.topology.iterrows():
+                source = link['source_id']
+                target = link['target_id']
+                # 如果有带宽和延迟信息，使用它们作为边的属性
+                if 'bandwidth' in self.topology.columns and 'latency' in self.topology.columns:
+                    bandwidth = link['bandwidth']
+                    latency = link['latency']
+                    G.add_edge(source, target, bandwidth=bandwidth, latency=latency, weight=1/bandwidth)
+                else:
+                    # 如果没有带宽和延迟信息，使用默认值
+                    G.add_edge(source, target, bandwidth=1000, latency=10, weight=1)
+        else:
+            # 如果没有拓扑数据，创建一个模拟拓扑
+            print("未找到拓扑数据，创建模拟拓扑...")
+            
+            # 从机器信息中获取节点数量
+            if self.machine_info is not None:
+                num_nodes = len(self.machine_info)
+            else:
+                num_nodes = 10  # 默认节点数
+            
+            # 创建节点
+            for i in range(num_nodes):
+                # 随机决定节点是云节点还是边缘节点（30%的概率是云节点）
+                is_cloud = random.random() < 0.3
+                G.add_node(i, is_cloud=is_cloud, gpu_num=random.randint(1, 8),
+                         cpu_num=random.randint(16, 64), mem_size=random.randint(64, 256))
+            
+            # 创建边（使用随机几何图模型）
+            pos = {i: (random.random(), random.random()) for i in range(num_nodes)}
+            distances = squareform(pdist([[pos[i][0], pos[i][1]] for i in range(num_nodes)]))
+            
+            # 连接近邻节点
+            for i in range(num_nodes):
+                for j in range(i+1, num_nodes):
+                    if distances[i][j] < 0.3:  # 距离阈值
+                        # 基于距离设置带宽和延迟
+                        bandwidth = 1000 * (1 - distances[i][j])  # 距离越近带宽越高
+                        latency = 10 * distances[i][j]  # 距离越近延迟越低
+                        G.add_edge(i, j, bandwidth=bandwidth, latency=latency, weight=1/bandwidth)
+        
+        # 确保图是连通的
+        if not nx.is_connected(G):
+            print("警告: 生成的网络拓扑不是连通的，将连接最大连通分量...")
+            largest_cc = max(nx.connected_components(G), key=len)
+            G = G.subgraph(largest_cc).copy()
+        
+        return G
+    
+    def get_content_distribution(self, num_contents=500):
+        """根据实例数据生成内容分布
+        
+        返回:
+            content_sizes: 内容大小列表
+            content_popularities: 内容流行度列表
+        """
+        if self.instance_info is not None and len(self.instance_info) > 0:
+            # 使用实例大小（如GPU内存使用）作为内容大小
+            if 'gpu_memory' in self.instance_info.columns:
+                content_sizes = self.instance_info['gpu_memory'].dropna().values
+            else:
+                # 如果没有GPU内存信息，使用任务持续时间作为代理
+                content_sizes = self.instance_info['duration'].dropna().values
+            
+            # 取num_contents个样本，如果数据不足则重复采样
+            if len(content_sizes) < num_contents:
+                content_sizes = np.random.choice(content_sizes, size=num_contents, replace=True)
+            else:
+                content_sizes = np.random.choice(content_sizes, size=num_contents, replace=False)
+            
+            # 规范化内容大小
+            content_sizes = np.clip(content_sizes, 1, 100)
+            
+            # 基于任务频率计算内容流行度
+            if self.resource_usage is not None and 'instance_id' in self.resource_usage.columns:
+                # 计算每个实例的请求次数
+                instance_counts = self.resource_usage['instance_id'].value_counts().to_dict()
+                
+                # 将任务频率映射到内容上
+                content_popularities = []
+                for i in range(num_contents):
+                    # 随机选择一个实例的频率
+                    instance_id = random.choice(list(instance_counts.keys()))
+                    popularity = instance_counts[instance_id]
+                    content_popularities.append(popularity)
+                
+                # 规范化流行度为概率分布
+                content_popularities = np.array(content_popularities)
+                content_popularities = content_popularities / content_popularities.sum()
+            else:
+                # 如果没有使用数据，使用Zipf分布
+                print("使用Zipf分布作为内容流行度...")
+                content_popularities = self._zipf_distribution(num_contents)
+            
+            return content_sizes, content_popularities
+        else:
+            # 如果没有实例数据，使用随机生成的内容分布
+            print("使用随机生成的内容分布...")
+            content_sizes = np.random.uniform(1, 10, num_contents)
+            content_popularities = self._zipf_distribution(num_contents)
+            return content_sizes, content_popularities
+    
+    def _zipf_distribution(self, num_contents, alpha=0.73):
+        """生成Zipf分布的内容流行度"""
+        ranks = np.arange(1, num_contents + 1)
+        probs = (ranks + 1) ** (-alpha)
+        return probs / np.sum(probs)
+    
+    def get_cache_capacities(self, graph):
+        """基于机器信息确定缓存容量"""
+        cache_capacities = {}
+        
+        if self.machine_info is not None:
+            for node in graph.nodes():
+                if node in self.machine_info['machine_id'].values:
+                    # 获取该节点的机器信息
+                    machine = self.machine_info[self.machine_info['machine_id'] == node].iloc[0]
+                    
+                    # 根据GPU内存或总内存计算缓存容量
+                    if 'gpu_memory' in self.machine_info.columns:
+                        cache_capacity = machine['gpu_memory'] * 0.3  # 使用GPU内存的30%作为缓存
+                    else:
+                        cache_capacity = machine['mem_size'] * 0.2  # 使用系统内存的20%作为缓存
+                    
+                    # 确保最小缓存容量
+                    cache_capacities[node] = max(50, cache_capacity)
+                else:
+                    # 如果找不到对应的机器信息，使用默认值
+                    cache_capacities[node] = 100
+        else:
+            # 如果没有机器信息，为每个节点分配默认缓存容量
+            for node in graph.nodes():
+                is_cloud = graph.nodes[node].get('is_cloud', False)
+                if is_cloud:
+                    # 云节点有更大的缓存
+                    cache_capacities[node] = 200
+                else:
+                    # 边缘节点缓存较小
+                    cache_capacities[node] = 100
+        
+        return cache_capacities
+
+# 深度Q网络
+class DQN(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, output_dim)
+        
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+# 经验回放记忆
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.memory = deque([], maxlen=capacity)
+        
+    def push(self, *args):
+        self.memory.append(Experience(*args))
+        
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+    
+    def __len__(self):
+        return len(self.memory)
+
+# 边缘缓存(EC)服务器代理
+class ECServerAgent:
+    def __init__(self, agent_id, is_cloud, state_dim, action_dim, cache_capacity):
+        self.agent_id = agent_id
+        self.is_cloud = is_cloud
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.cache_capacity = cache_capacity
+        
+        # 初始化策略网络和目标网络
+        self.policy_net = DQN(state_dim, action_dim).to(device)
+        self.target_net = DQN(state_dim, action_dim).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        
+        # 初始化优化器
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LEARNING_RATE)
+        
+        # 初始化回放记忆
+        self.memory = ReplayMemory(MEMORY_SIZE)
+        
+        # 初始化缓存内容
+        self.cached_content = set()
+        
+        # 缓存使用统计
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
+        # 节点角色（云或边缘）会影响缓存策略
+        self.role = "cloud" if is_cloud else "edge"
+            
+    def select_action(self, state, epsilon):
+        if random.random() > epsilon:
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).to(device)
+                q_values = self.policy_net(state_tensor)
+                return q_values.argmax().item()
+        else:
+            return random.randint(0, self.action_dim - 1)
+    
+    def optimize(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
+        
+        experiences = self.memory.sample(BATCH_SIZE)
+        batch = Experience(*zip(*experiences))
+        
+        # 转换为numpy数组再转为tensor以提高性能
+        state_batch = torch.FloatTensor(np.array(batch.state)).to(device)
+        action_batch = torch.LongTensor(np.array(batch.action)).unsqueeze(1).to(device)
+        reward_batch = torch.FloatTensor(np.array(batch.reward)).to(device)
+        next_state_batch = torch.FloatTensor(np.array(batch.next_state)).to(device)
+        done_batch = torch.FloatTensor(np.array(batch.done)).to(device)
+        
+        # 计算Q值
+        q_values = self.policy_net(state_batch).gather(1, action_batch)
+        
+        # 计算下一个状态的最大Q值
+        next_q_values = self.target_net(next_state_batch).max(1)[0]
+        
+        # 计算目标Q值
+        target_q_values = reward_batch + GAMMA * next_q_values * (1 - done_batch)
+        
+        # 计算损失
+        loss = F.mse_loss(q_values.squeeze(), target_q_values)
+        
+        # 优化模型
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+    
+    def update_cache(self, content, action_type):
+        """更新缓存内容
+        
+        Actions:
+        0: 全部缓存 - 缓存所有请求的内容
+        1: 保持现状 - 不改变缓存
+        2: 缓存本地请求 - 仅缓存来自本地用户的请求
+        3: 缓存邻居请求 - 仅缓存来自邻居的请求
+        4: 预缓存 - 基于流行度预缓存内容
+        5: 协同缓存 - 与其他节点协作决定缓存内容
+        """
+        content_id, req_agent_id, content_size = content
+        
+        # 如果是云节点，使用不同的缓存策略
+        if self.is_cloud:
+            # 云节点总是缓存所有内容
+            if len(self.cached_content) >= self.cache_capacity:
+                # 移除最不流行的内容
+                self.cached_content.pop()
+            self.cached_content.add(content)
+            return
+        
+        # 边缘节点使用动作选择的缓存策略
+        if action_type == 0:  # "全部缓存"
+            self._add_to_cache(content)
+        elif action_type == 1:  # "保持现状"
+            pass  # 不做任何改变
+        elif action_type == 2:  # "缓存本地请求"
+            if req_agent_id == self.agent_id:  # 如果内容是由该节点的用户请求的
+                self._add_to_cache(content)
+        elif action_type == 3:  # "缓存邻居请求"
+            if req_agent_id != self.agent_id:  # 如果内容是由其他节点的用户请求的
+                self._add_to_cache(content)
+        elif action_type == 4:  # "预缓存"
+            # 此策略会预测并缓存可能流行的内容
+            # 在实际实现中需要一个流行度预测模型
+            self._add_to_cache(content)
+        elif action_type == 5:  # "协同缓存"
+            # 该策略需要与其他节点通信来协调缓存决策
+            # 简化版：随机决定是否缓存
+            if random.random() < 0.5:
+                self._add_to_cache(content)
+    
+    def _add_to_cache(self, content):
+        """添加内容到缓存，如果缓存已满则移除最不流行的内容"""
+        content_id, req_agent_id, content_size = content
+        
+        # 计算添加此内容后的总缓存大小
+        current_cache_size = sum(c[2] for c in self.cached_content)
+        
+        # 如果缓存已满，需要移除一些内容
+        while current_cache_size + content_size > self.cache_capacity and self.cached_content:
+            # 尝试移除最不流行的内容
+            # 在实际实现中，这里应该基于访问频率或LRU策略
+            removed_content = next(iter(self.cached_content))
+            self.cached_content.remove(removed_content)
+            current_cache_size -= removed_content[2]
+        
+        # 添加新内容到缓存
+        if current_cache_size + content_size <= self.cache_capacity:
+            self.cached_content.add(content)
+    
+    def update_target_network(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+# 云边协同缓存环境
+class CloudEdgeCollaborationEnvironment:
+    def __init__(self, data_loader, num_contents=500):
+        """初始化云边协同环境
+        
+        Args:
+            data_loader: 阿里巴巴数据加载器
+            num_contents: 内容数量
+        """
+        self.data_loader = data_loader
+        self.num_contents = num_contents
+        
+        # 创建网络拓扑
+        self.graph = self.data_loader.create_network_topology()
+        self.num_agents = len(self.graph.nodes())
+        
+        # 获取内容大小和流行度
+        self.content_sizes, self.content_popularity = self.data_loader.get_content_distribution(num_contents)
+        
+        # 获取缓存容量
+        self.cache_capacities = self.data_loader.get_cache_capacities(self.graph)
+        
+        # 确定云节点和边缘节点
+        self.cloud_nodes = [n for n in self.graph.nodes() if self.graph.nodes[n].get('is_cloud', False)]
+        self.edge_nodes = [n for n in self.graph.nodes() if not self.graph.nodes[n].get('is_cloud', False)]
+        
+        print(f"环境初始化完成: {len(self.cloud_nodes)} 个云节点, {len(self.edge_nodes)} 个边缘节点")
+        
+        # 设置通信成本
+        self.setup_communication_costs()
+        
+        # 跟踪性能指标
+        self.total_latency = 0
+        self.total_bandwidth_used = 0
+        self.request_count = 0
+        self.hit_count = 0
+        
+        # 状态维度: [用户请求, 邻居请求, 已缓存内容, 节点类型, 缓存利用率]
+        self.state_dim = 3 * num_contents + 2
+        
+        # 动作空间: "全部缓存", "保持现状", "缓存本地请求", "缓存邻居请求", "预缓存", "协同缓存"
+        self.action_dim = 6
+        
+        # 记录当前和历史请求，用于请求模式分析
+        self.current_requests = {}
+        self.historical_requests = {}
+        
+        # 初始化代理对象
+        self.agents = {}
+        for node_id in self.graph.nodes():
+            is_cloud = node_id in self.cloud_nodes
+            self.agents[node_id] = ECServerAgent(
+                agent_id=node_id,
+                is_cloud=is_cloud,
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
+                cache_capacity=self.cache_capacities[node_id]
+            )
